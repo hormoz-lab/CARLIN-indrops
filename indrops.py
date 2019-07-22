@@ -57,12 +57,12 @@ def to_fastq(name, seq, qual):
     """
     return '@'+name+'\n'+seq+'\n+\n'+qual+'\n'
 
-def to_fastq_lines(bc, umi, seq, qual, read_name=''):
+def to_fastq_lines(bc, bc_qc, umi, umi_qc, seq, qual, read_name=''):
     """
     Return string that can be written to fastQ file
     """
     reformated_name = read_name.replace(':', '_')
-    name = '%s:%s:%s' % (bc, umi, reformated_name)
+    name = '%s:%s:%s:%s:%s' % (bc, umi, bc_qc, umi_qc, reformated_name)
     return to_fastq(name, seq, qual)
 
 def from_fastq(handle):
@@ -1292,7 +1292,7 @@ class V1V2Filtering(LibrarySequencingPart):
         LibrarySequencingPart.__init__(self, *args, **kwargs)
 
 
-    def filter_and_count_reads(self):
+    def filter_and_count_reads(self, clean_barcodes):
         """
         Input the two raw FastQ files
         Output: 
@@ -1327,12 +1327,12 @@ class V1V2Filtering(LibrarySequencingPart):
             for r_name, r1_seq, r1_qual, r2_seq, r2_qual in self._weave_fastqs(r1_filename, r2_filename):
                     
                 # Check if they should be kept
-                keep, result = self._process_reads(r1_seq, r2_seq, valid_bc1s=bc1s, valid_bc2s=bc2s)
+                keep, result = self._process_reads(r1_seq, r2_seq, r1_qual, r2_qual, clean_barcodes, valid_bc1s=bc1s, valid_bc2s=bc2s)
 
                 # Write the the reads worth keeping
                 if keep:
-                    bc, umi = result
-                    trim_process.write(to_fastq_lines(bc, umi, r2_seq, r2_qual, r_name))
+                    bc, bc_qc, umi, umi_qc = result
+                    trim_process.write(to_fastq_lines(bc, bc_qc, umi, umi_qc, r2_seq, r2_qual, r_name))
                     self.filtering_statistics_counter['Valid'] += 1
                 else:
                     self.filtering_statistics_counter[result] += 1
@@ -1402,7 +1402,7 @@ class V1V2Filtering(LibrarySequencingPart):
         r1_stream.close()
         r2_stream.close()
 
-    def _process_reads(self, name, read, valid_bc1s={}, valid_bc2s={}):
+    def _process_reads(self, name, read, name_qc, read_qc, clean_barcodes, valid_bc1s={}, valid_bc2s={}):
         """
         Returns either:
             True, (barcode, umi)
@@ -1467,14 +1467,18 @@ class V1V2Filtering(LibrarySequencingPart):
                  return False, 'No_polyT'
             
         bc1 = str(name[:w1_pos])
+        bc1_qc = str(name_qc[:w1_pos])
+
         bc2 = str(name[bc2_pos:umi_pos])
+        bc2_qc = str(name_qc[bc2_pos:umi_pos])
+
         umi = str(name[umi_pos:umi_pos+6])
+        umi_qc = str(name_qc[umi_pos:umi_pos+6])
         
         #Validate barcode (and try to correct when there is no ambiguity)
-        if valid_bc1s and valid_bc2s:
+        if clean_barcodes and valid_bc1s and valid_bc2s:
             # Check if BC1 and BC2 can be mapped to expected barcodes
             if bc1 in valid_bc1s:
-                # BC1 might be a neighboring BC, rather than a valid BC itself. 
                 bc1 = valid_bc1s[bc1]
             else:
                 return False, 'BC1'
@@ -1484,8 +1488,10 @@ class V1V2Filtering(LibrarySequencingPart):
                 return False, 'BC2'
             if 'N' in umi:
                 return False, 'UMI_error'
+
         bc = '%s-%s'%(bc1, bc2)
-        return True, (bc, umi)
+        bc_qc = '%s-%s'%(bc1_qc,bc2_qc)
+        return True, (bc, bc_qc, umi, umi_qc)
 
 class V3Demultiplexer():
 
@@ -1505,6 +1511,7 @@ class V3Demultiplexer():
 
     def _weave_fastqs(self, fastqs):
         last_extension = [fn.split('.')[-1] for fn in fastqs]
+        check_processes = True
         if all(ext == 'gz' for ext in last_extension):
             processes = [subprocess.Popen("gzip --stdout -d %s" % (fn), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for fn in fastqs]
             streams = [r.stdout for r in processes]
@@ -1512,6 +1519,7 @@ class V3Demultiplexer():
             processes = [subprocess.Popen("bzcat %s" % (fn), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for fn in fastqs]
             streams = [r.stdout for r in processes]
         elif all(ext == 'fastq' for ext in last_extension):
+            check_processes = False
             streams = [open(fn, 'r') for fn in fastqs]
         else:
             raise("ERROR: Different files are compressed differently. Check input.")
@@ -1522,11 +1530,6 @@ class V3Demultiplexer():
             blanks = [next(s)[:-1]  for s in streams]
             quals = [next(s)[:-1]  for s in streams]
 
-            for pp in processes:
-                p_err = pp.stderr.read()
-                if p_err:
-                    print_to_stderr(p_err)
-
             assert all(name==names[0] for name in names)
             yield names[0], seqs, quals
 
@@ -1534,7 +1537,7 @@ class V3Demultiplexer():
             s.close()
 
 
-    def _process_reads(self, name, seqs, quals, valid_bc1s={}, valid_bc2s={}, valid_libs={}):
+    def _process_reads(self, name, seqs, quals, clean_barcodes, valid_bc1s={}, valid_bc2s={}, valid_libs={}):
         """
         Returns either:
             True, (barcode, umi)
@@ -1544,6 +1547,7 @@ class V3Demultiplexer():
         """
 
         r1, r2, r3, r4 = seqs
+	q1, q2, q3, q4 = quals
         if self.run_version_details=='v3-miseq':
             r2 = rev_comp(r2)
             r4 = rev_comp(r4)
@@ -1553,28 +1557,36 @@ class V3Demultiplexer():
         else:
             return False, r3, 'Invalid_library_index'
 
-        if r2 in valid_bc1s:
-            bc1 = valid_bc1s[r2]
-        else:
-            return False, lib_index, 'Invalid_BC1'
+        bc1 = r2
+        bc1_qc = q2
 
-        orig_bc2 = r4[:8]
+        bc2 = r4[:8]
+        bc2_qc = q4[:8]
+
         umi = r4[8:8+6]
+        umi_qc = q4[8:8+6]
         polyA = r4[8+6:]
 
-        if orig_bc2 in valid_bc2s:
-            bc2 = valid_bc2s[orig_bc2]
-        else:
-            return False, lib_index, 'Invalid_BC2'
+        if clean_barcodes:
+            if bc1 in valid_bc1s:
+                bc1 = valid_bc1s[bc1]
+            else:
+                return False, lib_index, 'Invalid_BC1'
+    
+            if bc2 in valid_bc2s:
+                bc2 = valid_bc2s[bc2]
+            else:
+                return False, lib_index, 'Invalid_BC2'
+    
+            if 'N' in umi:
+                return False, lib_index, 'UMI_contains_N'
+    
+        bc = '%s-%s' % (bc1, bc2)
+        bc_qc = '%s-%s' % (bc1_qc, bc2_qc)
+        return True, lib_index, (bc, bc_qc, umi, umi_qc)
 
-        if 'N' in umi:
-            return False, lib_index, 'UMI_contains_N'
 
-        final_bc = '%s-%s' % (bc1, bc2)
-        return True, lib_index, (final_bc, umi)
-
-
-    def filter_and_count_reads(self):
+    def filter_and_count_reads(self, clean_barcodes):
         # Prepare error corrected index sets
         self.sequence_to_index_mapping = {}
         libs = self.libraries.keys()
@@ -1616,11 +1628,12 @@ class V3Demultiplexer():
         def print_ping_to_log(last_ping):
             sec_per_mil = (time.time() - last_ping)/(float(ping_every_n_reads)/10**6) if last_ping else 0
             total = overall_filtering_statistics['Total']
-            ping_format_data = {k: float(overall_filtering_statistics[k])/total for k in ['Valid', 'Invalid_library_index', 'Invalid_BC1',  'Invalid_BC2', 'UMI_contains_N']}
-            if overall_filtering_statistics['Valid'] > 0:
-                ping_format_data.update({k: float(self.libraries[k].filtering_statistics_counter['Valid'])/overall_filtering_statistics['Valid'] for k in manager_order})
-            print_to_stderr(ping_template.format(total=total, rate=sec_per_mil, **ping_format_data))
-
+            if (total > 0):
+                ping_format_data = {k: float(overall_filtering_statistics[k])/total for k in ['Valid', 'Invalid_library_index', 'Invalid_BC1',  'Invalid_BC2', 'UMI_contains_N']}
+                if overall_filtering_statistics['Valid'] > 0:
+                    ping_format_data.update({k: float(self.libraries[k].filtering_statistics_counter['Valid'])/overall_filtering_statistics['Valid'] for k in manager_order})
+                print_to_stderr(ping_template.format(total=total, rate=sec_per_mil, **ping_format_data))
+    
         common__ = defaultdict(int)
         print_to_stderr('Filtering %s, file %s' % (self.run_name, self.input_filename))
         for r_name, seqs, quals in self._weave_fastqs(input_fastqs):
@@ -1628,15 +1641,15 @@ class V3Demultiplexer():
             # Python 3 compatibility in mind!
             seqs = [s.decode('utf-8') for s in seqs]
 
-            keep, lib_index, result = self._process_reads(r_name, seqs, quals,
+            keep, lib_index, result = self._process_reads(r_name, seqs, quals, clean_barcodes,
                                                     error_corrected_barcodes, error_corrected_rev_compl_barcodes, 
                                                     self.sequence_to_index_mapping)
             common__[seqs[1]] += 1
             if keep:
-                bc, umi = result
+                bc, bc_qc, umi, umi_qc = result
                 bio_read = seqs[0]
                 bio_qual = quals[0]
-                trim_processes[lib_index].write(to_fastq_lines(bc, umi, bio_read, bio_qual, r_name[1:]))
+                trim_processes[lib_index].write(to_fastq_lines(bc, bc_qc, umi, umi_qc, bio_read, bio_qual, r_name[1:]))
                 self.libraries[lib_index].filtering_statistics_counter['Valid'] += 1
                 self.libraries[lib_index].filtering_statistics_counter['Total'] += 1
                 overall_filtering_statistics['Valid'] += 1
@@ -1692,6 +1705,10 @@ if __name__=="__main__":
     parser.add_argument('--ensembl-gtf-gz', help='[build_index] Path to gzipped ENSEMBL GTF file. ')
     parser.add_argument('--mode', help='[build_index] Stringency mode for transcriptome build. [strict|all_ensembl]', default='strict')
     parser.add_argument('--override-yaml', help="[all] Dictionnary to update project YAML with.. [You don't need this.]", nargs='?', default='')
+    cbexgroup = parser.add_mutually_exclusive_group(required=False)
+    cbexgroup.add_argument('--clean_barcodes', dest='clean_barcodes', action='store_true')
+    cbexgroup.add_argument('--no_clean_barcodes', dest='clean_barcodes', action='store_false')
+    parser.set_defaults(clean_barcodes=True)
 
     args = parser.parse_args()
     project = IndropsProject(args.project)
@@ -1745,7 +1762,7 @@ if __name__=="__main__":
 
         for part in worker_filter(target_run_parts, args.worker_index, args.total_workers):
             print_to_stderr('Filtering run "%s", library "%s", part "%s"' % (part.run_name, part.library_name if hasattr(part, 'library_name') else 'N/A', part.part_name))
-            part.filter_and_count_reads()
+            part.filter_and_count_reads(args.clean_barcodes)
 
     elif args.command == 'identify_abundant_barcodes':
         for library in worker_filter(target_libraries, args.worker_index, args.total_workers):
